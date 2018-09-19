@@ -20,4 +20,5 @@ Due to limited amount of time I could give to this task there are several things
 - error handling could be better
 - counting files is simplified
 - whole logic is in one file in the main
+- global execution context was used for the simplicity
 
