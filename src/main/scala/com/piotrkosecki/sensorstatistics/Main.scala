@@ -3,11 +3,10 @@ package com.piotrkosecki.sensorstatistics
 import java.nio.file.Paths
 
 import akka.actor.ActorSystem
-import akka.stream.ActorMaterializer
 import akka.stream.alpakka.csv.scaladsl.{CsvParsing, CsvToMap}
 import akka.stream.alpakka.file.scaladsl.Directory
 import akka.stream.scaladsl.FileIO
-import com.piotrkosecki.sensorstatistics.model.{Measurement, MeasurementStats, SensorStats}
+import com.piotrkosecki.sensorstatistics.model.{Measurement, SensorStats}
 
 import scala.concurrent.ExecutionContext
 import scala.util.Try
@@ -20,63 +19,47 @@ object Main {
 
     val path = Try(args(0)).toOption.getOrElse("src/main/resources/")
     implicit val system: ActorSystem = ActorSystem()
-    implicit val materializer: ActorMaterializer = ActorMaterializer()
     implicit val ec: ExecutionContext = ExecutionContext.global
 
-    val rawMeasurements = Directory.ls(Paths.get(path))
-      .filter { filePath =>
-        filePath.toString.endsWith(".csv")
-      }
-      .flatMapConcat { filename =>
-        FileIO.fromPath(filename)
-          .via(CsvParsing.lineScanner())
-          .via(CsvToMap.toMapAsStrings())
-      }
-      .map(_.toList)
-      .collect {
-        case (_, sensorId) :: (_, humidity) :: Nil => Measurement(sensorId, Try(humidity.toInt).toOption)
-      }
-      .runFold(Map.empty[String, List[Option[Int]]]) {
-        case (measurementsMap, Measurement(sId, hum)) =>
-          measurementsMap.get(sId) match {
-            case Some(value) => measurementsMap.updated(sId, hum :: value)
-            case None => measurementsMap + (sId -> List(hum))
-          }
-      }
+    val filePaths = Directory.ls(Paths.get(path)).filter { filePath =>
+      filePath.toString.endsWith(".csv")
+    }
 
-    // I could count with atomic Int but I didn't want to introduce variable,
-    // other way would be to pass the file names through stream and then count them
-    val filesCount = Directory.ls(Paths.get(path))
-      .filter { filePath =>
-        filePath.toString.endsWith(".csv")
-      }.runFold(0) {
+    val filesCount = filePaths.runFold(0) {
       case (count, _) => count + 1
     }
 
-    val stats = rawMeasurements.map { measurementsMap =>
-      val (succeeded, failed) = measurementsMap.flatMap(_._2).partition(_.isDefined)
-      MeasurementStats(succeeded.size, failed.size) -> measurementsMap
-        .toList
-        .map {
-          case (sid, measurements) =>
-            sid -> (for {
-              avg <- measurements.avg
-              min = measurements.collect {
-                case Some(value) => value
-              }.min
-              max = measurements.collect {
-                case Some(value) => value
-              }.max
-            } yield SensorStats(min, avg, max))
-        }.sortBy(_._2.map(-_.avg))
-    }
+    val rawMeasurements = filePaths.flatMapConcat { filename =>
+      FileIO
+        .fromPath(filename)
+        .via(CsvParsing.lineScanner())
+        .via(CsvToMap.toMapAsStrings())
+    }.map(_.toList)
+      .collect {
+        case (_, sensorId) :: (_, humidity) :: Nil => Measurement(sensorId, Try(humidity.toInt).toOption)
+      }
+      .runFold((Map.empty[String, Option[SensorStats]], 0)) {
+        case ((measurementsMap, failed), Measurement(sId, Some(hum))) =>
+          measurementsMap.get(sId).flatten match {
+            case Some(SensorStats(min, max, sum, count)) =>
+              measurementsMap.updated(
+                sId,
+                Some(SensorStats(math.min(min, hum), math.max(max, hum), sum + hum, count + 1))
+              ) -> failed
+            case None => (measurementsMap + (sId -> Some(SensorStats(hum, hum, hum, 1)))) -> failed
+          }
+        case ((measurementsMap, failed), Measurement(sId, None)) =>
+          measurementsMap.get(sId).flatten match {
+            case Some(_) => measurementsMap -> (failed + 1)
+            case None => (measurementsMap + (sId -> None)) -> 1
+          }
+      }
 
     for {
       fCount <- filesCount
-      (measurementStats, sensorStats) <- stats
+      (sensorStats, failedMeasurements) <- rawMeasurements
     } {
-      val processedMeasurements = measurementStats.failed + measurementStats.succeeded
-      val failedMeasurements = measurementStats.failed
+      val processedMeasurements = sensorStats.values.flatMap(_.toList).map(_.count).sum + failedMeasurements
 
       println(s"Num of processed files: $fCount")
       println(s"Num of processed measurements: $processedMeasurements")
@@ -85,10 +68,11 @@ object Main {
       println("Sensors with highest avg humidity:")
       println()
       println("sensor-id,min,avg,max")
-      sensorStats.foreach {
+      sensorStats.toList.sortBy(_._2.map(stats => stats.sum / stats.count)).foreach {
         case (sId, stat) =>
           println(s"$sId,${stat.getOrElse("NaN,NaN,NaN")}")
       }
+      system.terminate()
     }
   }
 
