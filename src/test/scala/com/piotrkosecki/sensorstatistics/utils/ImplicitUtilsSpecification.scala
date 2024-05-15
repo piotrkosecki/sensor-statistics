@@ -17,6 +17,6 @@ object ImplicitUtilsSpecification extends Properties("ImplicitUtils") {
   property("sorted") = forAll { list: List[Option[Int]] =>
     val (opts, nonOpts) = list.sorted.zipWithIndex.partition(_._1.isDefined)
     opts.map(_._2).maxOption.getOrElse(-1) < nonOpts.map(_._2).minOption.getOrElse(Int.MaxValue) &&
-      compare(opts.map(_._1.get))(_ >= _)
+    compare(opts.map(_._1.get))(_ >= _)
   }
 }

@@ -1,14 +1,14 @@
 package com.piotrkosecki.sensorstatistics
 
 import java.nio.file.Paths
-
 import akka.actor.ActorSystem
+import akka.stream.Materializer
 import akka.stream.alpakka.csv.scaladsl.{CsvParsing, CsvToMap}
 import akka.stream.alpakka.file.scaladsl.Directory
-import akka.stream.scaladsl.FileIO
+import akka.stream.scaladsl.{FileIO, Source}
 import com.piotrkosecki.sensorstatistics.model.{Measurement, SensorStats}
 
-import scala.concurrent.ExecutionContext
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Try
 
 object Main {
@@ -16,20 +16,36 @@ object Main {
   import utils.ImplicitUtils._
 
   def main(args: Array[String]): Unit = {
+    implicit val system: ActorSystem = ActorSystem("sensor-statistics-system")
+    implicit val ec: ExecutionContext = system.dispatcher
 
-    val path = Try(args(0)).toOption.getOrElse("src/main/resources/")
-    implicit val system: ActorSystem = ActorSystem()
-    implicit val ec: ExecutionContext = ExecutionContext.global
+    val path = getPath(args)
+    val filePaths = getFilePaths(path)
+    val filesCountFuture = countFiles(filePaths)
+    val rawMeasurementsFuture = getRawMeasurements(filePaths)
 
-    val filePaths = Directory.ls(Paths.get(path)).filter { filePath =>
-      filePath.toString.endsWith(".csv")
+    for {
+      filesCount <- filesCountFuture
+      (sensorStats, failedMeasurements) <- rawMeasurementsFuture
+    } yield {
+      printResults(filesCount, sensorStats, failedMeasurements)
+      system.terminate()
     }
+  }
 
-    val filesCount = filePaths.runFold(0) {
-      case (count, _) => count + 1
-    }
+  def getPath(args: Array[String]): String =
+    Try(args(0)).getOrElse("src/main/resources/")
 
-    val rawMeasurements = filePaths.flatMapConcat { filename =>
+  def getFilePaths(path: String): Source[java.nio.file.Path, _] =
+    Directory.ls(Paths.get(path)).filter(_.toString.endsWith(".csv"))
+
+  def countFiles(filePaths: Source[java.nio.file.Path, _])(implicit mat: Materializer): Future[Int] =
+    filePaths.runFold(0)((count, _) => count + 1)
+
+  def getRawMeasurements(
+      filePaths: Source[java.nio.file.Path, _]
+  )(implicit mat: Materializer): Future[(Map[String, Option[SensorStats]], Int)] =
+    filePaths.flatMapConcat { filename =>
       FileIO
         .fromPath(filename)
         .via(CsvParsing.lineScanner())
@@ -40,40 +56,42 @@ object Main {
       }
       .runFold((Map.empty[String, Option[SensorStats]], 0)) {
         case ((measurementsMap, failed), Measurement(sId, Some(hum))) =>
-          measurementsMap.get(sId).flatten match {
-            case Some(SensorStats(min, max, sum, count)) =>
-              measurementsMap.updated(
-                sId,
-                Some(SensorStats(math.min(min, hum), math.max(max, hum), sum + hum, count + 1))
-              ) -> failed
-            case None => (measurementsMap + (sId -> Some(SensorStats(hum, hum, hum, 1)))) -> failed
+          val updatedMap = measurementsMap.get(sId).flatten match {
+            case Some(stats) => updateStats(measurementsMap, sId, hum, stats)
+            case None => measurementsMap + (sId -> Some(SensorStats(hum, hum, hum, 1)))
           }
+          updatedMap -> failed
         case ((measurementsMap, failed), Measurement(sId, None)) =>
-          measurementsMap.get(sId).flatten match {
-            case Some(_) => measurementsMap -> (failed + 1)
-            case None => (measurementsMap + (sId -> None)) -> 1
+          val updatedMap = measurementsMap.get(sId).flatten match {
+            case Some(_) => measurementsMap
+            case None => measurementsMap + (sId -> None)
           }
+          updatedMap -> (failed + 1)
       }
 
-    for {
-      fCount <- filesCount
-      (sensorStats, failedMeasurements) <- rawMeasurements
-    } {
-      val processedMeasurements = sensorStats.values.flatMap(_.toList).map(_.count).sum + failedMeasurements
+  def updateStats(
+      measurementsMap: Map[String, Option[SensorStats]],
+      sId: String,
+      hum: Int,
+      stats: SensorStats
+  ): Map[String, Option[SensorStats]] =
+    measurementsMap.updated(
+      sId,
+      Some(SensorStats(math.min(stats.min, hum), math.max(stats.max, hum), stats.sum + hum, stats.count + 1))
+    )
 
-      println(s"Num of processed files: $fCount")
-      println(s"Num of processed measurements: $processedMeasurements")
-      println(s"Num of failed measurements: $failedMeasurements")
-      println()
-      println("Sensors with highest avg humidity:")
-      println()
-      println("sensor-id,min,avg,max")
-      sensorStats.toList.sortBy(_._2.map(stats => stats.sum / stats.count)).foreach {
-        case (sId, stat) =>
-          println(s"$sId,${stat.getOrElse("NaN,NaN,NaN")}")
-      }
-      system.terminate()
+  def printResults(filesCount: Int, sensorStats: Map[String, Option[SensorStats]], failedMeasurements: Int): Unit = {
+    val processedMeasurements = sensorStats.values.flatten.map(_.count).sum + failedMeasurements
+
+    println(s"Num of processed files: $filesCount")
+    println(s"Num of processed measurements: $processedMeasurements")
+    println(s"Num of failed measurements: $failedMeasurements")
+    println("\nSensors with highest avg humidity:\n")
+    println("sensor-id,min,avg,max")
+
+    sensorStats.toList.sortBy(_._2.map(stats => stats.sum / stats.count)).foreach {
+      case (sId, Some(stats)) => println(s"$sId,${stats.min},${stats.sum / stats.count},${stats.max}")
+      case (sId, None) => println(s"$sId,NaN,NaN,NaN")
     }
   }
-
 }
